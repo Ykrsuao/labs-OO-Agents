@@ -15,17 +15,20 @@ Architecture:
 
 import asyncio
 import base64
+import codecs
 import logging
 import os
 import secrets
 import signal
+import sys
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_CHARS = 30_000
+BASE64_DECODE = "base64 -D" if sys.platform == "darwin" else "base64 -d"
 _DRAIN_TIMEOUT = 0.05  # Seconds to wait for remaining output after sentinel
 _SIGTERM_GRACE = 5.0  # Seconds to wait for sentinel after SIGTERM
 _SIGKILL_GRACE = 2.0  # Seconds to wait for sentinel after SIGKILL
@@ -47,6 +50,8 @@ class BashSession:
         stdout, stderr, code = await session.run("cd src && pwd")  # cd persists!
         await session.close()
     """
+
+    shell_name = "bash"
 
     def __init__(self, cwd: str | Path = ".", init_command: str | None = None) -> None:
         self._cwd = Path(cwd).resolve()
@@ -239,7 +244,7 @@ class BashSession:
         # b64encode, not encodebytes: the latter wraps at 76 characters, and a
         # newline inside the here-string would split the payload across lines.
         blob = base64.b64encode(command.encode()).decode()
-        return f'eval "$(base64 -d <<<{blob})" </dev/null\n{protocol}'
+        return f'eval "$({BASE64_DECODE} <<<{blob})" </dev/null\n{protocol}'
 
     def _ensure_lock_on_current_loop(self) -> None:
         """Recreate the lock if the event loop changed since it was created."""
@@ -317,7 +322,7 @@ class BashSession:
 
     async def run_stream(
         self, command: str, timeout: float = 30.0
-    ) -> AsyncIterator[tuple[str, str]]:
+    ) -> AsyncGenerator[tuple[str, str], None]:
         """Run a command and yield (stream_name, chunk) pairs as output arrives.
 
         stream_name is 'stdout' or 'stderr'. After the command finishes,
@@ -328,12 +333,16 @@ class BashSession:
         """
         self._ensure_lock_on_current_loop()
         async with self._lock:
-            async for item in self._run_stream_unlocked(command, timeout):
-                yield item
+            stream = self._run_stream_unlocked(command, timeout)
+            try:
+                async for item in stream:
+                    yield item
+            finally:
+                await stream.aclose()
 
     async def _run_stream_unlocked(
         self, command: str, timeout: float
-    ) -> AsyncIterator[tuple[str, str]]:
+    ) -> AsyncGenerator[tuple[str, str], None]:
         """Actual run_stream implementation (caller must hold self._lock)."""
         if not self._started:
             await self.start()
@@ -375,54 +384,73 @@ class BashSession:
 
         # Read stdout/stderr concurrently, yielding chunks as they arrive,
         # while watching the control fd for the sentinel.
-        stdout_queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
-        stderr_queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
+        output: asyncio.Queue[tuple[str, bytes]] = asyncio.Queue()
+        decoders = {
+            name: codecs.getincrementaldecoder("utf-8")(errors="replace")
+            for name in ("stdout", "stderr")
+        }
 
-        async def _read_stream(stream, name, queue):
-            try:
-                while True:
-                    chunk = await stream.read(4096)
-                    if not chunk:
-                        break
-                    queue.put_nowait((name, chunk.decode("utf-8", errors="replace")))
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-            finally:
-                queue.put_nowait(None)
+        async def _read_stream(stream, name):
+            while chunk := await stream.read(4096):
+                output.put_nowait((name, chunk))
 
-        stdout_task = asyncio.create_task(_read_stream(proc.stdout, "stdout", stdout_queue))
-        stderr_task = asyncio.create_task(_read_stream(proc.stderr, "stderr", stderr_queue))
-
-        ctrl_lines, timed_out = await self._read_control_until(sentinel, timeout)
-
-        # Sentinel received — cancel readers and drain remaining.
-        stdout_task.cancel()
-        stderr_task.cancel()
-        for task in (stdout_task, stderr_task):
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        readers = [
+            asyncio.create_task(_read_stream(proc.stdout, "stdout")),
+            asyncio.create_task(_read_stream(proc.stderr, "stderr")),
+        ]
+        control = asyncio.create_task(self._read_control_until(sentinel, timeout))
+        pending_output = None
+        completed = False
+        try:
+            while not control.done():
+                pending_output = asyncio.create_task(output.get())
+                done, _ = await asyncio.wait(
+                    [pending_output, control], return_when=asyncio.FIRST_COMPLETED
+                )
+                if pending_output in done:
+                    name, data = pending_output.result()
+                    text = decoders[name].decode(data)
+                    if text:
+                        yield name, text
+                else:
+                    pending_output.cancel()
+                await asyncio.gather(pending_output, return_exceptions=True)
+                pending_output = None
+            ctrl_lines, timed_out = await control
+            completed = True
+        finally:
+            tasks = [control, *readers]
+            if pending_output is not None:
+                tasks.append(pending_output)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if not completed:
+                await self.close()
 
         # Drain queues
-        for q in (stdout_queue, stderr_queue):
-            while not q.empty():
-                item = q.get_nowait()
-                if item is not None:
-                    yield item
+        while not output.empty():
+            name, data = output.get_nowait()
+            text = decoders[name].decode(data)
+            if text:
+                yield name, text
 
         # Greedy-drain remaining pipe data
         for stream, name in [(proc.stdout, "stdout"), (proc.stderr, "stderr")]:
-            while True:
+            deadline = asyncio.get_running_loop().time() + _DRAIN_TIMEOUT
+            while (remaining := deadline - asyncio.get_running_loop().time()) > 0:
                 try:
-                    chunk = await asyncio.wait_for(stream.read(4096), timeout=_DRAIN_TIMEOUT)
+                    chunk = await asyncio.wait_for(stream.read(4096), timeout=remaining)
                     if not chunk:
                         break
-                    yield (name, chunk.decode("utf-8", errors="replace"))
+                    text = decoders[name].decode(chunk)
+                    if text:
+                        yield name, text
                 except (TimeoutError, Exception):
                     break
+            tail = decoders[name].decode(b"", final=True)
+            if tail:
+                yield name, tail
 
         # Parse exit code
         exit_code = -1 if not ctrl_lines else 0
@@ -654,7 +682,7 @@ class BashSession:
             self._control_transport = None
         self._control_reader = None
 
-        if self._process is not None and self._process.returncode is None:
+        if self._process is not None:
             same_loop = self._started_on_loop is asyncio.get_running_loop()
             if same_loop:
                 # Graceful shutdown: SIGTERM → wait → SIGKILL on timeout
@@ -669,11 +697,12 @@ class BashSession:
                 try:
                     await asyncio.wait_for(self._process.wait(), timeout=3.0)
                 except TimeoutError:
-                    try:
-                        pgid = os.getpgid(self._process.pid)
-                        os.killpg(pgid, signal.SIGKILL)
-                    except (ProcessLookupError, OSError):
-                        pass
+                    pass
+                # The shell can exit before a descendant that ignores SIGTERM.
+                try:
+                    os.killpg(self._process.pid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
             else:
                 # Cross-loop (gl-212): transport is dead, just kill immediately.
                 try:

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from nooa import Agent
 from nooa.storage import SQLiteStorageManager
 from nooa.unifiedllm import CompletionClient
@@ -57,3 +59,28 @@ def test_restore_latest_returns_most_recent():
     agent2 = _SimpleAgent(storage=storage)
     storage.restore_latest_snapshot(agent2)
     assert agent2.value == 99
+
+
+def test_latest_snapshot_breaks_timestamp_ties_by_insertion(monkeypatch):
+    from nooa.storage import sqlite
+
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+
+    class FixedClock:
+        @staticmethod
+        def now(tz):
+            return timestamp
+
+    monkeypatch.setattr(sqlite, "datetime", FixedClock)
+    with _make_storage() as storage:
+        agent = _SimpleAgent(storage=storage)
+        agent.value = 1
+        first = storage.save_snapshot(agent)
+        agent.value = 99
+        second = storage.save_snapshot(agent)
+
+        assert first != second
+        assert storage.get_latest_snapshot_id() == second
+        restored = _SimpleAgent(storage=storage)
+        assert storage.restore_latest_snapshot(restored)
+        assert restored.value == 99

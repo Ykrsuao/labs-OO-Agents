@@ -7,7 +7,6 @@ Provides persistent storage using stdlib sqlite3 — no new dependencies.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
 import os
@@ -617,6 +616,9 @@ class SessionAlreadyActiveError(Exception):
         self.owner_pid = owner_pid
 
 
+_SESSION_LOCK_OFFSET = 32
+
+
 def _read_lock_pid(lock_path: str) -> int | None:
     """Read the owner PID written by whichever process currently holds the lock.
 
@@ -624,8 +626,9 @@ def _read_lock_pid(lock_path: str) -> int | None:
     Returns None if the file is missing, empty, or not parseable.
     """
     try:
-        with open(lock_path, "rb") as f:
-            raw = f.read(32).strip()
+        # Do not read ahead into the mandatory Windows lock at byte 32.
+        with open(lock_path, "rb", buffering=0) as f:
+            raw = f.read(_SESSION_LOCK_OFFSET).strip()
     except OSError:
         return None
     if not raw:
@@ -636,14 +639,44 @@ def _read_lock_pid(lock_path: str) -> int | None:
         return None
 
 
+def _lock_session_file(fd: int) -> None:
+    """Acquire an OS-managed nonblocking lock without locking the PID metadata."""
+    if os.name == "nt":
+        import msvcrt
+
+        # Windows locks are mandatory. Lock beyond the 32-byte PID read region
+        # so another process can still report who owns an active session.
+        os.lseek(fd, _SESSION_LOCK_OFFSET, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _release_session_lock(fd: int) -> None:
+    """Unlock and close the session descriptor on every supported platform."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, _SESSION_LOCK_OFFSET, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def _acquire_session_lock(lock_path: str) -> int:
-    """Acquire an exclusive flock on *lock_path*, returning the held fd.
+    """Acquire an exclusive OS lock on *lock_path*, returning the held fd.
 
     Raises SessionAlreadyActiveError, annotated with the recorded owner PID
     so the caller can tell the user exactly which process is holding the
-    session. On Linux/macOS flock is released by the kernel when the owning
-    process dies, so a genuine crash doesn't wedge the next run — no
-    stale-file cleanup needed here.
+    session. The OS releases the lock when its owning descriptors close,
+    including on process exit. The remaining lock file does not need cleanup.
 
     Lock file contents: the ASCII decimal PID of the current owner. We
     truncate before writing so a shorter PID can't leave trailing digits
@@ -651,7 +684,7 @@ def _acquire_session_lock(lock_path: str) -> int:
     """
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_session_file(fd)
     except OSError:
         os.close(fd)
         owner_pid = _read_lock_pid(lock_path)
@@ -659,8 +692,8 @@ def _acquire_session_lock(lock_path: str) -> int:
         if owner_pid is not None:
             msg = (
                 f"Session {session_id!r} is already active in another process "
-                f"(pid {owner_pid}). If that process is gone, remove "
-                f"{lock_path!r} to reclaim the session."
+                f"(pid {owner_pid}). Close that session before reopening it; "
+                "the lock is released automatically when its process exits."
             )
         else:
             msg = (
@@ -670,9 +703,13 @@ def _acquire_session_lock(lock_path: str) -> int:
         raise SessionAlreadyActiveError(msg, session_id=session_id, owner_pid=owner_pid) from None
 
     # Holder now; replace any stale predecessor PID with ours.
-    os.lseek(fd, 0, os.SEEK_SET)
-    os.ftruncate(fd, 0)
-    os.write(fd, str(os.getpid()).encode())
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+    except BaseException:
+        _release_session_lock(fd)
+        raise
     return fd
 
 
@@ -706,8 +743,7 @@ def delete_sqlite_database(db_path: str | Path) -> bool:
                 pass
         return existed
     finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        os.close(lock_fd)
+        _release_session_lock(lock_fd)
 
 
 class SQLiteStorageManager:
@@ -842,8 +878,9 @@ class SQLiteStorageManager:
     def get_latest_snapshot_id(self) -> str | None:
         """Return the snapshot_id of the most recently saved snapshot, or None."""
         with self._db_lock:
+            # Coarse-grained clocks can give consecutive saves the same timestamp.
             row = self._conn.execute(
-                "SELECT snapshot_id FROM snapshots ORDER BY created_at DESC LIMIT 1"
+                "SELECT snapshot_id FROM snapshots ORDER BY created_at DESC, rowid DESC LIMIT 1"
             ).fetchone()
             return row[0] if row is not None else None
 
@@ -879,9 +916,9 @@ class SQLiteStorageManager:
                     conn.close()
         finally:
             if self._lock_fd is not None:
-                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-                os.close(self._lock_fd)
+                fd = self._lock_fd
                 self._lock_fd = None
+                _release_session_lock(fd)
 
     def __enter__(self) -> Self:
         return self

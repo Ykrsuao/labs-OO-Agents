@@ -53,6 +53,46 @@ jobs:
       - name: Sandbox containment tests
         run: uv run pytest -q -m sandbox
 
+  native-core:
+    name: Native core (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.12", "3.13"]
+    env:
+      PYTHONUTF8: "1"
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Sync native development environment
+        run: uv sync --frozen --group dev
+      - name: Native imports, file tools, state, and model-free execution
+        run: >-
+          uv run --frozen --no-sync pytest
+          tests/platform/test_native_basics.py
+          tests/storage
+          tests/test_sqlite_close_commit.py
+          tests/test_sqlite_specific.py
+          tests/test_sqlite_reconnect.py
+          tests/test_sqlite_storage_latest.py
+          tests/unit/test_remaining_full_coverage.py::TestSQLiteSessionLocking
+          -q --timeout=90
+      - name: Native shell lifecycle and coding workflow
+        run: >-
+          uv run --frozen --no-sync pytest
+          tests/platform/test_shell_workflow.py
+          tests/platform/test_powershell_session.py
+          -q --timeout=90
+
   python-313-error-compat:
     runs-on: ubuntu-latest
     permissions:

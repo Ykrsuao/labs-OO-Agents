@@ -43,7 +43,7 @@ async def tail(path: str, *, poll_interval: float = 0.5):
     Starts from the current end of file. Polls every
     *poll_interval* seconds.
     """
-    fh = open(path)
+    fh = open(path, encoding="utf-8")
     try:
         fh.seek(0, 2)
         while True:
@@ -69,12 +69,31 @@ async def monitor(cmd: str):
     """Stream stdout lines from a shell command as they appear.
 
     Yields each line (stripped) as it's written to stdout.
-    stderr is merged into stdout.  Uses ``start_new_session=True``
-    for process-group isolation so multiple concurrent monitors
-    (and the agent itself) don't contend for ptys or interfere
-    with each other.  On cancellation the entire process group
-    is killed to prevent orphaned children.
+    stderr is merged into stdout. Windows uses a PowerShell session with job
+    ownership; POSIX uses a new process group. Closing or cancelling a monitor
+    terminates its owned processes.
     """
+    if os.name == "nt":
+        from nooa.tools._powershell_session import PowerShellSession
+
+        session = PowerShellSession()
+        stream = session.run_stream(cmd, timeout=None)
+        pending = ""
+        try:
+            async for kind, text in stream:
+                if kind == "__done__":
+                    break
+                pending += text
+                while "\n" in pending:
+                    line, pending = pending.split("\n", 1)
+                    yield line.rstrip("\r")
+            if pending:
+                yield pending.rstrip("\r")
+        finally:
+            await stream.aclose()
+            await session.close()
+        return
+
     proc = await asyncio.create_subprocess_shell(
         cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -87,12 +106,12 @@ async def monitor(cmd: str):
             yield line.decode().rstrip("\n")
         await proc.wait()
     finally:
-        if proc.returncode is None:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, OSError):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            if proc.returncode is None:
                 try:
                     proc.kill()
                 except ProcessLookupError:
                     pass
-            await proc.wait()
+        await proc.wait()

@@ -9,7 +9,6 @@ Use ``symbols()`` to find definitions and ``refs()`` to find usages. Both return
 
 import logging
 import re
-import shlex
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,7 +16,7 @@ from typing import Annotated
 
 from nooa.agentdoc import hidden, spec
 from nooa.skill import Skill
-from nooa.tools._bash_session import BashSession
+from nooa.tools._shell_session import ShellSession, command_from_args
 from nooa.tools.shell_tools import Match
 
 logger = logging.getLogger(__name__)
@@ -262,7 +261,7 @@ def _tree_sitter_available() -> bool:
 
 def _line_match(path: Path, line_no: int) -> Match | None:
     try:
-        lines = path.read_text(errors="replace").splitlines(keepends=True)
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
     except OSError:
         return None
     if not (1 <= line_no <= len(lines)):
@@ -272,7 +271,7 @@ def _line_match(path: Path, line_no: int) -> Match | None:
 
 def _symbol_anchor_pairs(path: Path, symbols: list[str]) -> list[tuple[str, Match]]:
     try:
-        lines = path.read_text(errors="replace").splitlines(keepends=True)
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
     except OSError:
         return []
     pairs: list[tuple[str, Match]] = []
@@ -306,16 +305,13 @@ def _symbol_anchors(path: Path, symbols: list[str]) -> list[Match]:
 
 
 def _anchor_from_match_line(line: str, root: Path) -> Match | None:
-    path_text, sep, rest = line.partition(":")
-    if not sep:
-        return None
-    m = re.match(r"\s*(\d+)\b", rest)
+    m = re.match(r"^(.*?):\s*(\d+)(?::|\s|$)", line)
     if not m:
         return None
-    fpath = Path(path_text)
+    fpath = Path(m.group(1))
     if not fpath.is_absolute():
         fpath = root / fpath
-    return _line_match(fpath, int(m.group(1)))
+    return _line_match(fpath, int(m.group(2)))
 
 
 def _format_match(anchor: Match, root: Path) -> str:
@@ -370,7 +366,7 @@ def _extract_symbols(path: Path, lang: str, max_symbols: int = 200) -> list[str]
         return []
 
     try:
-        text = path.read_text(errors="replace")
+        text = path.read_text(encoding="utf-8", errors="replace")
     except (OSError, PermissionError):
         return []
 
@@ -411,7 +407,7 @@ class RepoTools(Skill):
     def __init__(
         self,
         root: str | Path = ".",
-        session: BashSession | None = None,
+        session: ShellSession | None = None,
         require_tree_sitter: bool = False,
     ) -> None:
         self._root = Path(root).resolve()
@@ -435,8 +431,8 @@ class RepoTools(Skill):
 
     @property
     @hidden
-    def session(self) -> BashSession | None:
-        """The shared bash session, if one was wired in (else None)."""
+    def session(self) -> ShellSession | None:
+        """The shared native shell session, if one was wired in."""
         return self._session
 
     async def symbols(
@@ -513,7 +509,9 @@ class RepoTools(Skill):
         """Check if rg (ripgrep) is available, caching the result."""
         if self._has_rg is None:
             if self._session:
-                _, _, code = await self._session.run("command -v rg", timeout=5)
+                _, _, code = await self._session.run(
+                    command_from_args(self._session, ["rg", "--version"]), timeout=5
+                )
                 self._has_rg = code == 0
             else:
                 import shutil
@@ -606,10 +604,10 @@ class RepoTools(Skill):
             # Use rg to find files respecting gitignore, or fall back to walking
             if self._session and await self._check_rg():
                 stdout, _, _ = await self._session.run(
-                    f"rg --files {shlex.quote(str(resolved))} 2>/dev/null | head -{max_files * 3}",
+                    command_from_args(self._session, ["rg", "--files", "--", str(resolved)]),
                     timeout=15,
                 )
-                for line in stdout.splitlines():
+                for line in stdout.splitlines()[: max_files * 3]:
                     p = Path(line.strip())
                     if p.is_file() and _detect_lang(p) != "unknown":
                         all_files.append(p)
@@ -700,10 +698,12 @@ class RepoTools(Skill):
             # Build a regex that matches common definition patterns
             pattern = f"(def|class|function|func|struct|trait|interface|type|impl|module|const)\\s+\\w*{re.escape(name)}\\w*"
             stdout, _, _ = await self._session.run(
-                f"rg -n -i --color=never {shlex.quote(pattern)} {shlex.quote(str(resolved))} 2>/dev/null | head -{max_results * 2}",
+                command_from_args(
+                    self._session, ["rg", "-n", "-i", "--color=never", "--", pattern, str(resolved)]
+                ),
                 timeout=30,
             )
-            for line in stdout.splitlines():
+            for line in stdout.splitlines()[: max_results * 2]:
                 if line.strip():
                     matches.append(line.strip())
         else:
@@ -832,17 +832,19 @@ class RepoTools(Skill):
         search_name = re.escape(name)
         pattern = f"\\b{search_name}\\b"
 
-        if self._session:
-            cmd = f"rg -n --color=never {shlex.quote(pattern)} {shlex.quote(str(resolved))} 2>/dev/null | head -{max_results * 3}"
+        if self._session and await self._check_rg():
+            cmd = command_from_args(
+                self._session, ["rg", "-n", "--color=never", "--", pattern, str(resolved)]
+            )
             stdout, _, code = await self._session.run(cmd, timeout=30)
             if code != 0 or not stdout:
                 return ReferenceSearchResult(query=name, matches=[], total_matches=0)
-            raw_lines = stdout.strip().splitlines()
+            raw_lines = stdout.strip().splitlines()[: max_results * 3]
         else:
             raw_lines = []
             for fpath in self._iter_source_files(resolved, max_files=200):
                 try:
-                    text = fpath.read_text(errors="replace")
+                    text = fpath.read_text(encoding="utf-8", errors="replace")
                     for i, line in enumerate(text.splitlines(), 1):
                         if re.search(rf"\b{re.escape(name)}\b", line):
                             rel = fpath.relative_to(self._root)
@@ -857,10 +859,11 @@ class RepoTools(Skill):
             if len(matches) >= max_results:
                 break
             # Parse file:line:content
-            parts = raw.split(":", 2)
-            if len(parts) < 3:
+            parsed = re.match(r"^(.*?):(\d+):(.*)$", raw)
+            if parsed is None:
                 continue
-            content = parts[2].strip()
+            path_text, line_no, content = parsed.groups()
+            content = content.strip()
             # Skip definitions
             if _is_definition_line(content, name.split(".")[-1]):
                 continue
@@ -871,7 +874,7 @@ class RepoTools(Skill):
             anchor = _anchor_from_match_line(raw, self._root)
             if anchor is None:
                 continue
-            matches.append(f"{parts[0]}:{parts[1]}: {content}")
+            matches.append(f"{path_text}:{line_no}: {content}")
             anchors.append(anchor)
 
         truncated = len(matches) >= max_results

@@ -235,6 +235,10 @@ For deeper authoring guidance, see `skills/nooa-agent-authoring/SKILL.md`.
 
 ## Python & Dependencies
 
+- This fork's product targets native Windows, Linux, and macOS. WSL is not a
+  substitute for native Windows delivery. Keep OS-specific operations explicit
+  and maintain the `native-core` CI tests; see `docs/platform-support.md` for the
+  current gaps before claiming cross-platform support.
 - **Use `uv` exclusively** for package management — never pip, pip-tools, poetry, or conda.
 - Add packages: `uv add <package>`
 - Remove packages: `uv remove <package>`

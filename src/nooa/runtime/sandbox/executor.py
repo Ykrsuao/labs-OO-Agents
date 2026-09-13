@@ -95,6 +95,12 @@ class SandboxedExecutor:
         max_error: int | None = None,
         error_tail: int | None = None,
     ):
+        if config.start_method not in mp.get_all_start_methods():
+            raise SandboxUnavailable(
+                f"Sandbox start method {config.start_method!r} is not available on this platform. "
+                "Disabling guardrails cannot make this process backend supported."
+            )
+
         self._agent = agent
         self._config = config
         self._cell_timeout = cell_timeout

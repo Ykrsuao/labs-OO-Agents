@@ -50,6 +50,16 @@ Client creation overhead.
 ### `provider_compat/` - Provider compatibility
 Provider compatibility checks across model backends and API shapes.
 
+### `platform/` - Native core contracts
+Shell-independent imports, command help, UTF-8 file operations, session locks,
+snapshots, model-free generation, and sandbox capability handling. The
+suite also covers native shell streaming, state, exact stdin, repository
+navigation, and an edit/test/Git-diff coding workflow. Windows-specific tests
+exercise PowerShell 7 and Windows PowerShell 5.1, including descendant cleanup.
+The `native-core` CI matrix runs the applicable checks on Windows, Linux, and
+macOS. It is not a replacement for model-provider or packaged-application
+testing. See [platform support](../docs/platform-support.md).
+
 ### `runtime/` - Runtime internals
 Context building, event manager, code execution, hooks, pure Python executor/REPL, structured output executor, async deadlock prevention, span relationships, truncation behavior, and runtime evaluation.
 

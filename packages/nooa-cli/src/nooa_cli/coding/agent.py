@@ -127,6 +127,7 @@ class CodingAgent(InteractiveAgent):
             prefix=True,
         )
         self.context["todo_status"] = Context(expr="self.todo.status()")
+        self.context["shell_environment"] = Context(expr="self.shell.describe_environment()")
         self.context["context_usage"] = Context(
             expr="self.context_stats.format() if self.context_stats else ''"
         )

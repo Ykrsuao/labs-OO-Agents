@@ -21,8 +21,8 @@ from nooa.context_blocks import EventBase
 from nooa.context_blocks.roles import Role
 from nooa.runtime.event_manager import EventManager
 from nooa.skill import Skill
-from nooa.tools._bash_session import BashSession
 from nooa.tools._results import StreamDone, StreamEvent
+from nooa.tools._shell_session import ShellSession
 from nooa.tools.shell_tools import FileWrite, Match, ShellResult, ShellTools
 
 logger = logging.getLogger(__name__)
@@ -233,9 +233,17 @@ class ActivityShellTools(Skill):
 
     @property
     @hidden
-    def session(self) -> BashSession:
-        """The wrapped shell's persistent bash session."""
+    def session(self) -> ShellSession:
+        """The wrapped shell's persistent native session."""
         return self._shell.session
+
+    @property
+    def shell_name(self) -> str:
+        return self._shell.shell_name
+
+    def describe_environment(self) -> str:
+        """Describe command syntax and the current working directory."""
+        return self._shell.describe_environment()
 
     @hidden
     async def close(self) -> None:

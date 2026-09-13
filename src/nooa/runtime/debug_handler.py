@@ -399,9 +399,9 @@ _dump_dir: Path = Path(".")
 
 
 def install_debug_handler(dump_dir: Path | None = None) -> None:
-    """Install SIGUSR2 handler for debug dumps.
+    """Install a SIGUSR2 debug handler on platforms that provide that signal.
 
-    Safe to call multiple times - only installs once.
+    Safe to call multiple times. Manual dumps remain available without SIGUSR2.
 
     Args:
         dump_dir: Directory to write debug_dump_<pid>.txt files. Defaults to cwd.
@@ -425,8 +425,11 @@ def install_debug_handler(dump_dir: Path | None = None) -> None:
         logger.debug("faulthandler.enable() skipped: %s", exc)
 
     # Install SIGUSR2 handler (less commonly used than SIGUSR1)
+    debug_signal = getattr(signal, "SIGUSR2", None)
+    if debug_signal is None:
+        return
     try:
-        signal.signal(signal.SIGUSR2, _debug_signal_handler)
+        signal.signal(debug_signal, _debug_signal_handler)
         _handler_installed = True
     except (ValueError, OSError):
         # Can't set signal handler (not main thread, or platform issue)

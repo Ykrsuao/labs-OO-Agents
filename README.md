@@ -71,6 +71,11 @@ Want to see how the pieces compose? Take the [**10-minute tour**](https://github
 
 ## Installation
 
+For native Windows, Linux, and macOS coverage and remaining product work, see
+[Native Platform Support](docs/platform-support.md). Commands use native
+PowerShell on Windows and bash on Linux/macOS. The Linux sandbox is a separate,
+platform-specific capability.
+
 Add the **core** framework to a new (or existing) Python project with [uv](https://docs.astral.sh/uv/getting-started/installation/):
 
 ```bash
