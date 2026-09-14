@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import deque
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,61 @@ def powershell_command_from_args(args: list[str]) -> str:
     return "& " + " ".join(
         quote_powershell(arg) for arg in [sys.executable, "-c", bootstrap, payload]
     )
+
+
+class _CommandOutput:
+    """Keep the command monitor running even when its consumer stops reading."""
+
+    def __init__(self) -> None:
+        self._memory: deque[tuple[str, str]] = deque()
+        self._file: tempfile.SpooledTemporaryFile[bytes] | None = None
+        self._read_position = 0
+        self._write_position = 0
+        self._ready = asyncio.Event()
+        self._finished = False
+        self._error: BaseException | None = None
+
+    def put(self, kind: str, text: str) -> None:
+        if self._file is None and len(self._memory) < 128:
+            self._memory.append((kind, text))
+        else:
+            if self._file is None:
+                self._file = tempfile.SpooledTemporaryFile(max_size=65536, mode="w+b")
+            self._file.seek(self._write_position)
+            self._file.write((json.dumps([kind, text]) + "\n").encode("utf-8"))
+            self._write_position = self._file.tell()
+        self._ready.set()
+
+    async def get(self) -> tuple[str, str] | None:
+        while True:
+            if self._memory:
+                return self._memory.popleft()
+            if self._file is not None:
+                self._file.seek(self._read_position)
+                kind, text = json.loads(self._file.readline())
+                self._read_position = self._file.tell()
+                if self._read_position == self._write_position:
+                    self._file.close()
+                    self._file = None
+                    self._read_position = self._write_position = 0
+                return kind, text
+            if self._finished:
+                if self._error is not None:
+                    raise self._error
+                return None
+            self._ready.clear()
+            await self._ready.wait()
+
+    def finish(self, error: BaseException | None = None) -> None:
+        self._error = error
+        self._finished = True
+        self._ready.set()
+
+    def close(self) -> None:
+        self._memory.clear()
+        file, self._file = self._file, None
+        if file is not None:
+            file.close()
 
 
 class PowerShellSession:
@@ -239,6 +295,44 @@ class PowerShellSession:
     ) -> AsyncGenerator[tuple[str, str], None]:
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive or None")
+        output = _CommandOutput()
+        source = self._execute_command(command, timeout)
+
+        async def produce() -> None:
+            error: BaseException | None = None
+            try:
+                async for kind, text in source:
+                    output.put(kind, text)
+            except BaseException as exc:
+                error = exc
+            finally:
+                try:
+                    await source.aclose()
+                except BaseException as exc:
+                    error = error or exc
+                output.finish(error)
+
+        producer = asyncio.create_task(produce())
+        completed = False
+        try:
+            while event := await output.get():
+                if event[0] == "__done__":
+                    completed = True
+                yield event
+        finally:
+            if not producer.done():
+                producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+            await source.aclose()
+            try:
+                output.close()
+            finally:
+                if not completed:
+                    await self._abort("interruption")
+
+    async def _execute_command(
+        self, command: str, timeout: float | None
+    ) -> AsyncGenerator[tuple[str, str], None]:
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=128)
         self._active = queue
         self._active_id = secrets.token_hex(12)

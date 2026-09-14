@@ -39,11 +39,15 @@ WSL 可以用于在 Windows 机器上进行 Linux 开发和回归测试，但不
 
 Windows 后端使用独立 PowerShell 进程和持久 runspace。正常调用之间保留工作目录、环境变量、PowerShell 变量和函数。控制消息通过独立的本机连接传输，不从普通命令输出中寻找结束标记。
 
+Linux/macOS 的 bash 由内部 Python 监管进程管理。监管进程先清理 bash 原始进程组，再回收 bash，避免 shell 的 PID 被复用后误伤其他进程组。主会话通过私有管道发出清理请求；宿主退出使管道关闭时，也会触发清理。该机制用于生命周期管理，不是安全沙箱；主动创建新会话、脱离原始进程组的程序不在这项清理保证之内。
+
 标准输出、错误输出可以流式读取。原生程序的退出码和显式 `exit N` 会正确返回；程序自己退出为 124 与真正超时通过 `timed_out` 区分。交互式输入提示会明确失败，应通过 `stdin=` 提供输入。
 
 框架内部按参数列表调用外部程序时，通过 Python 标准库传递原生 argv，避免 PowerShell 5.1 丢失空参数、引号或合并带反斜杠的参数。直接传给 `run(command)` 的字符串仍然遵守当前 shell 的语法，不会自动把 bash 命令转换为 PowerShell。
 
 `run()` 对每一路返回文本保留最多 30,000 个字符，超出后附加截断提示。需要持续消费大输出时使用 `run_stream()`。PowerShell 输出分块不会拆开 UTF-16 代理对，避免部分 Unicode 字符在分块边界变成乱码。
+
+PowerShell 命令启动后，由独立异步任务监控完成状态、超时和进程回收，不依赖调用方继续读取输出。因此，暂停读取不会延迟超时清理，也不会把已经完成的命令误报为超时。内存缓冲有上限，积压输出会暂存到临时文件，恢复读取时仍保持完整顺序；缓存读完或输出流关闭时释放临时文件。
 
 `stdin=` 按 UTF-8 原样传递文本，包括末尾没有换行的输入。Windows 使用子 shell 处理这类调用，因此继承工作目录和环境，但不继承主 runspace 的普通变量、函数；子 shell 对目录和环境的修改也不会回写主会话。
 
@@ -52,6 +56,8 @@ Windows 使用 Job Object 管理 PowerShell 及其后代进程。超时、取消
 - PowerShell 普通变量、函数和后台任务需要重新创建，结果中会给出重置提示。
 - 已经发生的文件修改和外部副作用不会回滚，取消操作不是事务撤销。
 - Job Object 在这里用于进程清理，不是文件系统或网络安全沙箱。
+
+Bash 超时后若成功恢复原会话，会同步控制通道返回的工作目录。因此，紧接着使用文件工具时仍按实际目录读写，不需要先执行一次 `pwd` 才恢复正确状态。
 
 RepoTools 不再依赖 `head`、`/dev/null` 和 `command -v`，并能识别带盘符的 Windows 搜索结果。安装 ripgrep 时使用它加速搜索，未安装时保留 Python 回退路径。后台 `monitor()` 也按平台选择执行方式，并在关闭时清理其所属进程。
 
@@ -62,7 +68,7 @@ RepoTools 不再依赖 `head`、`/dev/null` 和 `command -v`，并能识别带�
 | Shell 命令执行 | 已实现 Windows PowerShell 与 Linux/macOS bash 两条执行路径，覆盖流式输出、stdin、状态及取消。 | 完成真实 macOS CI 验证，并继续验证产品实际使用的外部程序和安装环境。非 UTF-8 旧程序可能仍需要显式编码适配。 |
 | 后台命令与输出监听 | Windows 使用 PowerShell/Job Object，POSIX 使用独立进程组；均有流式读取和取消路径。 | 继续扩展长时间运行、复杂子进程结构以及宿主断开重连的测试。 |
 | 受限代码执行 | 当前工作进程依赖 `fork`，文件系统和网络的强隔离依赖 Linux 能力。 | 为各平台选择并验证适用的隔离机制。不能将缺失的保护宣称为已生效，也不能在未重新设计 Python 对象跨进程传递机制时，直接把 `fork` 换成 `spawn`。 |
-| 安装与打包 | 已构建核心 wheel 和源码分发包，确认包含 PowerShell 辅助脚本；已在独立 Python 环境中安装 wheel 并运行 Windows shell 检查。 | 仍需在各平台的干净系统中验证完整产品的安装、升级、应用数据目录，以及随产品提供的 shell 或运行时依赖。Python wheel 验证不等于桌面产品安装包验收。 |
+| 安装与打包 | 已构建核心 wheel 和源码分发包，确认包含 PowerShell 辅助脚本与 POSIX 监管模块；已在独立 Python 环境中安装 wheel 并运行 Windows、Linux shell 检查。 | 仍需在各平台的干净系统中验证完整产品的安装、升级、应用数据目录，以及随产品提供的 shell 或运行时依赖。Python wheel 验证不等于桌面产品安装包验收。 |
 | 完整编码流程 | 已增加临时 Git 项目中的文件读取、代码修改、符号查询、单元测试和 Git diff 闭环，使用脚本化模型响应验证执行流程。 | 通过 macOS 实际 runner，并补齐真实模型、最终产品界面和安装包层面的验收。 |
 
 如果沙箱要求的进程启动方式在当前平台不可用，即使请求了可选保护降级，也会抛出 `SandboxUnavailable`。平台能力检测不应仅因缺少 `resource` 模块就导致程序崩溃。
@@ -76,7 +82,7 @@ $env:PYTHONUTF8 = "1"
 $env:LITELLM_LOCAL_MODEL_COST_MAP = "True"
 uv sync --frozen --group dev
 uv run --frozen --no-sync pytest tests/platform/test_native_basics.py -q
-uv run --frozen --no-sync pytest tests/platform/test_shell_workflow.py tests/platform/test_powershell_session.py -q
+uv run --frozen --no-sync pytest tests/platform/test_shell_workflow.py tests/platform/test_powershell_session.py tests/platform/test_bash_lifecycle.py -q
 ```
 
 在 Linux 和 macOS 上，先设置环境变量 `PYTHONUTF8=1` 和 `LITELLM_LOCAL_MODEL_COST_MAP=True`，再运行相同的 `uv` 命令。
@@ -117,3 +123,29 @@ Windows 验证还覆盖：含空格和中文的路径、空参数及引号、超
 编码流程测试在临时 Git 项目中完成“读取文件、修改代码、查询符号、执行单元测试、检查 Git diff”，并验证 CodingAgent 会将当前 shell 环境放入模型上下文。它证明了这一受控流程可执行，不等于真实模型在任意项目上的成功率评测。
 
 Linux 回归仍报告既有的子进程退出清理和 `fork` 等警告，未在本轮顺带重构。远程 CI 的运行结果需要单独核查，不能把已配置矩阵写成已经通过矩阵。
+
+## 审查修复验证结果
+
+2026-09-14 针对原生 shell 审查中的三项问题完成修复，公开的 `ShellTools` 接口保持不变：
+
+| 问题 | 为什么需要修改 | 修复及回归范围 |
+|---|---|---|
+| Bash 超时后文件工具目录错位 | shell 的目录已改变，但恢复流程没有同步缓存，可能写错同名文件。 | 恢复时同步实际目录；覆盖普通调用和流式调用超时后立即写文件。 |
+| PowerShell 暂停读取导致超时失效或误报 | `yield` 会暂停生成器，调用方的读取节奏不应决定执行截止时间。 | 独立监控任务维护超时和完成状态；两版 PowerShell 均验证暂停消费、已完成命令和积压大输出。 |
+| Bash 关闭时对复用 PID 发送信号 | 已回收的数字 PID 不能证明进程归属，直接跳过清理又会留下后台进程。 | 监管进程在清理原进程组前不回收 bash；覆盖 shell 提前退出、忽略 SIGTERM 的后台进程和宿主异常退出。 |
+
+扩大回归还修复了事件循环重建时命令锁被提前更换的问题，并用 `DefaultSelector` 避免监管器受 `select()` 高编号描述符限制。补充了启动途中取消、跨循环串行执行和高编号管道测试。一个会话仍不承诺支持同时从多个运行中的事件循环访问。
+
+本次修复后的实际验证结果：
+
+| 环境或检查 | 结果 |
+|---|---|
+| 原生 Windows，Python 3.12 | 220 项通过、9 项 POSIX 专属测试跳过；PowerShell 7.6.5 和 Windows PowerShell 5.1.26100.9444 均覆盖。 |
+| Linux 默认主测试集，WSL Ubuntu / Python 3.12 | 7,199 项通过、50 项跳过、3 项预期失败、298 项按标记排除；不调用真实模型 API。 |
+| Linux 实际沙箱工作进程 | 62 项通过、63 项按标记排除。 |
+| POSIX 生命周期、并发及 SIGINT 专项回归 | 38 项通过；与主测试集部分重叠，不重复累计。 |
+| 核心包构建与独立安装 | wheel 和源码分发包均包含与当前源码一致的 POSIX 监管模块及 PowerShell 辅助文件。脱离检出目录安装 wheel 后，两版 PowerShell 的参数、stdin、目录检查，以及 Linux 的执行、超时恢复和文件写入检查通过。 |
+| 静态检查 | 全仓库 Ruff 代码与格式检查、SPDX 文件头检查及 `git diff --check` 通过。三个变更实现模块的对应平台 Pyright 检查无诊断；POSIX 模块另按 macOS 目标检查。 |
+| macOS、Python 3.13、远程 CI | 本轮没有实机或远程运行证据。新增生命周期测试已纳入 `native-core` 矩阵，但配置矩阵和静态类型检查不等于实际运行通过。 |
+
+Linux 测试仍报告事件循环关闭时的子进程清理、`fork` 和弃用警告，本轮未将这些历史问题视为已解决。此次未改变模型接入配置、代理监听范围或 PowerShell 系统执行策略，也未以这组测试替代真实模型与安装包验收。

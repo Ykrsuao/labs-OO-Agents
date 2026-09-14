@@ -91,6 +91,7 @@ jobs:
           uv run --frozen --no-sync pytest
           tests/platform/test_shell_workflow.py
           tests/platform/test_powershell_session.py
+          tests/platform/test_bash_lifecycle.py
           -q --timeout=90
 
   python-313-error-compat:

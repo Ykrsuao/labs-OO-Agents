@@ -177,6 +177,102 @@ async def test_powershell_timeout_retains_completed_directory_and_environment(se
     assert (await session.run("Write-Output $env:NOOA_SAVED"))[0] == "value"
 
 
+async def test_powershell_stream_timeout_does_not_wait_for_the_consumer(session, tmp_path):
+    await session.run("Write-Output warm")
+    marker = tmp_path / "after-deadline.txt"
+    stream = session.run_stream(
+        "Write-Output ready; Start-Sleep -Seconds 2; "
+        "Set-Content -LiteralPath after-deadline.txt -Value unexpected",
+        timeout=0.5,
+    )
+    try:
+        first = await asyncio.wait_for(anext(stream), timeout=5)
+        assert first[0] == "stdout" and "ready" in first[1]
+
+        await asyncio.sleep(2.3)
+
+        assert not marker.exists(), "The command continued after its deadline"
+        remaining = [event async for event in stream]
+        assert remaining[-1] == ("__done__", "124,1")
+        assert (await session.run("Write-Output recovered"))[0] == "recovered"
+    finally:
+        await stream.aclose()
+
+
+async def test_powershell_completed_stream_does_not_time_out_while_unread(session, tmp_path):
+    await session.run("Write-Output warm")
+    marker = tmp_path / "completed.txt"
+    stream = session.run_stream(
+        "$nooa_saved_value = 42; Write-Output ready; "
+        "Set-Content -LiteralPath completed.txt -Value complete",
+        timeout=1,
+    )
+    try:
+        first = await asyncio.wait_for(anext(stream), timeout=5)
+        assert first[0] == "stdout" and "ready" in first[1]
+        async with asyncio.timeout(0.5):
+            while not marker.exists():
+                await asyncio.sleep(0.01)
+
+        await asyncio.sleep(1.2)
+
+        remaining = [event async for event in stream]
+        assert remaining[-1] == ("__done__", "0,0")
+        assert (await session.run("Write-Output $nooa_saved_value"))[0] == "42"
+    finally:
+        await stream.aclose()
+
+
+async def test_powershell_backlogged_output_is_complete_and_ordered(session, tmp_path):
+    await session.run("Write-Output warm")
+    marker = tmp_path / "completed-output.txt"
+    stream = session.run_stream(
+        "$payload = -join (0..399 | ForEach-Object { "
+        "('{0:D4}:' -f $_) + ('x' * 2048) + \"`n\" }); "
+        "[Console]::Out.Write($payload); "
+        "Set-Content -LiteralPath completed-output.txt -Value done",
+        timeout=10,
+    )
+    try:
+        first = await asyncio.wait_for(anext(stream), timeout=5)
+        assert first[0] == "stdout"
+        async with asyncio.timeout(5):
+            while not marker.exists():
+                await asyncio.sleep(0.01)
+        await asyncio.sleep(0.2)
+
+        remaining = [event async for event in stream]
+        assert remaining[-1] == ("__done__", "0,0")
+        stdout = first[1] + "".join(text for kind, text in remaining if kind == "stdout")
+        assert stdout == "".join(f"{index:04d}:" + "x" * 2048 + "\n" for index in range(400))
+    finally:
+        await stream.aclose()
+
+
+async def test_powershell_timeout_reaps_a_process_with_unread_output(session):
+    await session.run("Write-Output warm")
+    process = session._process
+    assert process is not None
+    stream = session.run_stream(
+        "[Console]::Out.Write(('x' * 1000000)); Start-Sleep -Seconds 30",
+        timeout=3,
+    )
+    try:
+        with ProcessHandle(process.pid) as handle:
+            first = await asyncio.wait_for(anext(stream), timeout=5)
+            assert first[0] == "stdout"
+
+            await asyncio.sleep(3.5)
+
+            assert not handle.running(), "Backlogged output delayed process cleanup"
+            remaining = [event async for event in stream]
+        assert remaining[-1] == ("__done__", "124,1")
+        stdout = first[1] + "".join(text for kind, text in remaining if kind == "stdout")
+        assert len(stdout) >= 600000
+    finally:
+        await stream.aclose()
+
+
 async def test_powershell_closing_a_stream_reaps_its_process_tree(session, tmp_path):
     marker = tmp_path / "stream-children.json"
     script = process_tree_script(tmp_path)

@@ -3,8 +3,6 @@
 """Tests for BashSession asyncio.Lock loop-mismatch fix (gl-212)."""
 
 import asyncio
-import os
-import signal
 
 import pytest
 
@@ -16,15 +14,8 @@ def bash_session():
     """Create a BashSession for testing."""
     session = BashSession()
     yield session
-    # Best-effort cleanup — kill the subprocess if still alive
-    if session._process is not None and session._process.returncode is None:
-        try:
-            os.killpg(os.getpgid(session._process.pid), signal.SIGKILL)
-        except Exception:
-            try:
-                session._process.kill()
-            except Exception:
-                pass
+    if session._process is not None:
+        session._process.close_control()
 
 
 class TestLockLoopMismatch:
@@ -99,9 +90,12 @@ class TestLockLoopMismatch:
         await bash_session.run("echo start")
         original_lock = bash_session._lock
 
-        # Simulate a loop change by setting _started_on_loop to a different object
-        bash_session._started_on_loop = object()
-        bash_session._ensure_lock_on_current_loop()
+        other_loop = asyncio.new_event_loop()
+        try:
+            bash_session._lock_loop = other_loop
+            bash_session._ensure_lock_on_current_loop()
+        finally:
+            other_loop.close()
         assert bash_session._lock is not original_lock
 
     def test_run_after_close_on_new_loop(self, bash_session):

@@ -25,6 +25,8 @@ import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
+from nooa.tools._posix_shell_process import PosixShellProcess
+
 logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_CHARS = 30_000
@@ -60,12 +62,13 @@ class BashSession:
         # conda env). Re-run on reset() because a fresh bash loses prior env.
         self._init_command = init_command
         self._running_init = False
-        self._process: asyncio.subprocess.Process | None = None
+        self._process: PosixShellProcess | None = None
         self._control_reader: asyncio.StreamReader | None = None
         self._control_transport: asyncio.BaseTransport | None = None
         self._started = False
         self._started_on_loop: asyncio.AbstractEventLoop | None = None
         self._lock = asyncio.Lock()
+        self._lock_loop: asyncio.AbstractEventLoop | None = None
         self._last_successful_command: float | None = None
         self._last_command: str = ""
         self._start_count: int = 0
@@ -76,19 +79,13 @@ class BashSession:
         return self._cwd
 
     def __del__(self) -> None:
-        """Best-effort cleanup: kill the bash subprocess if still running."""
+        """Release the supervisor's lifeline without looking up a recycled PID."""
         proc = self._process
-        if proc is not None and proc.returncode is None:
+        if proc is not None:
             try:
-                # During interpreter shutdown, module globals (os, signal) may
-                # be None, causing TypeError. Broad except handles all cases.
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGKILL)
+                proc.close_control()
             except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                pass
 
     async def __aenter__(self) -> "BashSession":
         """Support ``async with BashSession() as session:`` usage."""
@@ -165,47 +162,45 @@ class BashSession:
 
         # Create pipe for control channel (fd 3 inside bash).
         ctrl_r, ctrl_w = os.pipe()
-        try:
-            self._process = await asyncio.create_subprocess_exec(
-                "/bin/bash",
-                "--norc",
-                "--noprofile",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(self._cwd),
-                env=env,
-                start_new_session=True,
-                pass_fds=(ctrl_w,),
-            )
-        except Exception:
-            os.close(ctrl_r)
-            os.close(ctrl_w)
-            raise
-
-        # Dup the write end to fd 3 inside bash, then close the original.
-        assert self._process.stdin is not None
-        self._process.stdin.write(f"exec 3>&{ctrl_w} {ctrl_w}>&-\n".encode())
-        await self._process.stdin.drain()
-        os.close(ctrl_w)
-
-        # Wrap the read end in an asyncio StreamReader.
         loop = asyncio.get_running_loop()
-        reader = asyncio.StreamReader(limit=2**20)
-        transport, _ = await loop.connect_read_pipe(
-            lambda: asyncio.StreamReaderProtocol(reader),
-            os.fdopen(ctrl_r, "rb", 0),
-        )
-        self._control_reader = reader
-        self._control_transport = transport
-        self._started = True
-        self._started_on_loop = asyncio.get_running_loop()
+        self._started_on_loop = loop
+        try:
+            self._process = await PosixShellProcess.start(self._cwd, env, ctrl_w)
 
-        # Drain startup — send a no-op through the control channel.
-        sentinel = f"__CTRL_{secrets.token_hex(8)}__"
-        self._process.stdin.write(f"echo {sentinel} >&3\n".encode())
-        await self._process.stdin.drain()
-        await self._read_control_until(sentinel, timeout=5.0)
+            # Dup the write end to fd 3 inside bash, then close the original.
+            assert self._process.stdin is not None
+            self._process.stdin.write(f"exec 3>&{ctrl_w} {ctrl_w}>&-\n".encode())
+            await self._process.stdin.drain()
+            os.close(ctrl_w)
+            ctrl_w = -1
+
+            reader = asyncio.StreamReader(limit=2**20)
+            read_pipe = os.fdopen(ctrl_r, "rb", 0)
+            ctrl_r = -1
+            try:
+                transport, _ = await loop.connect_read_pipe(
+                    lambda: asyncio.StreamReaderProtocol(reader), read_pipe
+                )
+            except BaseException:
+                read_pipe.close()
+                raise
+            self._control_reader = reader
+            self._control_transport = transport
+            await self._process.ready(reader)
+            self._started = True
+
+            # Drain startup — send a no-op through the control channel.
+            sentinel = f"__CTRL_{secrets.token_hex(8)}__"
+            self._process.stdin.write(f"echo {sentinel} >&3\n".encode())
+            await self._process.stdin.drain()
+            await self._read_control_until(sentinel, timeout=5.0)
+        except BaseException:
+            await self.close()
+            raise
+        finally:
+            for fd in (ctrl_r, ctrl_w):
+                if fd >= 0:
+                    os.close(fd)
 
         # Run the one-time init command (env setup) before any user command.
         # ``_running_init`` guards against re-entry if _send_and_wait triggers a
@@ -248,11 +243,10 @@ class BashSession:
 
     def _ensure_lock_on_current_loop(self) -> None:
         """Recreate the lock if the event loop changed since it was created."""
-        if (
-            self._started_on_loop is not None
-            and self._started_on_loop is not asyncio.get_running_loop()
-        ):
+        loop = asyncio.get_running_loop()
+        if self._lock_loop is not None and self._lock_loop is not loop:
             self._lock = asyncio.Lock()
+        self._lock_loop = loop
 
     async def run(self, command: str, timeout: float = 30.0) -> tuple[str, str, int]:
         """Run a command and return (stdout, stderr, exit_code).
@@ -592,7 +586,7 @@ class BashSession:
 
     async def _interrupt_and_recover(
         self,
-        proc: asyncio.subprocess.Process,
+        proc: PosixShellProcess,
         sentinel: str,
         original_timeout: float,
     ) -> bool:
@@ -602,8 +596,10 @@ class BashSession:
         """
         ctrl = self._control_reader
         assert ctrl is not None
+        last_control_line: str | None = None
 
         async def try_drain(grace: float) -> bool:
+            nonlocal last_control_line
             while True:
                 try:
                     raw = await asyncio.wait_for(ctrl.readline(), timeout=grace)
@@ -611,8 +607,13 @@ class BashSession:
                     return False
                 if not raw:
                     return False
-                if sentinel in raw.decode("utf-8", errors="replace"):
+                line = raw.decode("utf-8", errors="replace").rstrip("\n")
+                if sentinel in line:
+                    # Recovery consumes the command's cwd before returning its sentinel.
+                    if last_control_line is not None and last_control_line.startswith("/"):
+                        self._cwd = Path(last_control_line)
                     return True
+                last_control_line = line
 
         async def kill_children(sig: int) -> None:
             killed_any = False
@@ -638,7 +639,7 @@ class BashSession:
             if not killed_any:
                 # SIGINT to bash (like Ctrl-C) to break pending reads.
                 try:
-                    os.kill(proc.pid, signal.SIGINT)
+                    proc.send_signal(signal.SIGINT)
                 except (ProcessLookupError, OSError):
                     pass
 
@@ -683,37 +684,20 @@ class BashSession:
         self._control_reader = None
 
         if self._process is not None:
+            process = self._process
             same_loop = self._started_on_loop is asyncio.get_running_loop()
-            if same_loop:
-                # Graceful shutdown: SIGTERM → wait → SIGKILL on timeout
-                try:
-                    pgid = os.getpgid(self._process.pid)
-                    os.killpg(pgid, signal.SIGTERM)
-                except (ProcessLookupError, OSError):
+            try:
+                if same_loop:
+                    process.terminate()
                     try:
-                        self._process.kill()
-                    except Exception:
-                        pass
-                try:
-                    await asyncio.wait_for(self._process.wait(), timeout=3.0)
-                except TimeoutError:
-                    pass
-                # The shell can exit before a descendant that ignores SIGTERM.
-                try:
-                    os.killpg(self._process.pid, signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
-            else:
-                # Cross-loop (gl-212): transport is dead, just kill immediately.
-                try:
-                    pgid = os.getpgid(self._process.pid)
-                    os.killpg(pgid, signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    try:
-                        self._process.kill()
-                    except Exception:
-                        pass
+                        await asyncio.wait_for(process.wait(), timeout=3)
+                    except TimeoutError:
+                        process.kill()
+                        await asyncio.wait_for(process.wait(), timeout=5)
+                else:
+                    process.kill()
+            finally:
+                process.close_control()
         self._process = None
         self._started = False
         self._started_on_loop = None
-        self._lock = asyncio.Lock()
