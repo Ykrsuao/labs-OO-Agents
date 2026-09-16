@@ -5,6 +5,8 @@
 import os
 import shutil
 import subprocess
+import sys
+import textwrap
 
 import click.testing
 import pytest
@@ -113,3 +115,60 @@ def test_console_script_requires_a_model():
 
     assert result.returncode == 2
     assert "--model" in result.stderr
+
+
+@pytest.mark.parametrize("configured", [None, "True", "False"])
+def test_model_metadata_policy_is_set_before_framework_import(configured):
+    environment = _clean_env()
+    environment["EXPECTED_COST_MAP"] = configured or "True"
+    if configured is None:
+        environment.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
+    else:
+        environment["LITELLM_LOCAL_MODEL_COST_MAP"] = configured
+    script = textwrap.dedent(
+        """
+        import importlib.abc
+        import os
+        import sys
+        from types import ModuleType
+
+        class ImportObserved(Exception):
+            pass
+
+        class CheckPolicy(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "nooa":
+                    actual = os.getenv("LITELLM_LOCAL_MODEL_COST_MAP")
+                    expected = os.environ["EXPECTED_COST_MAP"]
+                    assert actual == expected, (actual, expected)
+                    raise ImportObserved
+
+        server = ModuleType("nooa_acp.server")
+
+        async def serve(llm_factory):
+            llm_factory()
+
+        server.serve = serve
+        sys.modules[server.__name__] = server
+        sys.meta_path.insert(0, CheckPolicy())
+
+        from nooa_acp.cli import main
+
+        try:
+            main()
+        except ImportObserved:
+            pass
+        else:
+            raise AssertionError("The real CLI never reached its model factory")
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script, "--model", "openai/gpt-4o-mini"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr

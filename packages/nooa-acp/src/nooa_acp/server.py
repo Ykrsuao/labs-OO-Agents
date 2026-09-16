@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from acp import (
     PROTOCOL_VERSION,
@@ -47,31 +48,22 @@ from acp.schema import (
 from acp.schema import (
     SessionInfo as ACPSessionInfo,
 )
-from nooa_cli.coding import (
-    CodingAgent,
-    CodingSlashCommand,
-    CodingSlashCommandRegistry,
-    load_coding_skills_dirs,
-)
-from nooa_cli.sessions import (
-    InvalidSessionIdError,
-    SessionHandle,
-    SessionNotFoundError,
-    SessionStore,
-)
 
-from nooa.errors import GenerationError
-from nooa.mcp import MCPManager, MCPTool
-from nooa.slash_dispatch import CoercionError
-from nooa.unifiedllm import UnifiedLLM
 from nooa_acp._runtime import (
     SessionBusyError,
     SessionRuntime,
     SessionRuntimeClosedError,
     SessionRuntimePool,
 )
-from nooa_acp.dispatcher import InteractiveSessionDispatcher
-from nooa_acp.event_bridge import ACPEventBridge
+
+if TYPE_CHECKING:
+    from nooa_cli.coding import CodingAgent, CodingSlashCommand, CodingSlashCommandRegistry
+    from nooa_cli.sessions import SessionHandle, SessionStore
+
+    from nooa.mcp import MCPTool
+    from nooa.unifiedllm import UnifiedLLM
+    from nooa_acp.dispatcher import InteractiveSessionDispatcher
+    from nooa_acp.event_bridge import ACPEventBridge
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +189,8 @@ class CodingACPAdapter:
         additional_directories: list[str] | None = None,
         **kwargs: Any,
     ) -> LoadSessionResponse:
+        from nooa_cli.sessions import InvalidSessionIdError, SessionNotFoundError
+
         del kwargs
         root = self._validate_workspace(cwd, additional_directories)
         try:
@@ -262,6 +256,9 @@ class CodingACPAdapter:
         return CloseSessionResponse()
 
     async def prompt(self, session_id: str, prompt: list[Any], **kwargs: Any) -> PromptResponse:
+        from nooa.errors import GenerationError
+        from nooa.slash_dispatch import CoercionError
+
         del kwargs
         runtime = await self._get_runtime(session_id)
         text = self._prompt_text(prompt)
@@ -396,6 +393,15 @@ class CodingACPAdapter:
         commands: CodingSlashCommandRegistry | None = None
         value: _ACPSession | None = None
         try:
+            from nooa_cli.coding import (
+                CodingAgent,
+                CodingSlashCommandRegistry,
+                load_coding_skills_dirs,
+            )
+
+            from nooa_acp.dispatcher import InteractiveSessionDispatcher
+            from nooa_acp.event_bridge import ACPEventBridge
+
             mcp, mcp_warnings = await self._create_mcp_tools(mcp_servers)
             agent = CodingAgent(
                 llm=llm,
@@ -457,6 +463,11 @@ class CodingACPAdapter:
         mcp_servers: list[Any] | None,
     ) -> tuple[dict[str, MCPTool], tuple[str, ...]]:
         servers = list(mcp_servers or [])
+        if not servers:
+            return {}, ()
+
+        from nooa.mcp import MCPManager
+
         supported_types = (McpServerStdio, HttpMcpServer, SseMcpServer)
         tools: dict[str, MCPTool] = {}
         warnings: list[str] = []
@@ -567,6 +578,8 @@ class CodingACPAdapter:
 
     @staticmethod
     def _store(root: Path) -> SessionStore:
+        from nooa_cli.sessions import SessionStore
+
         return SessionStore(root / ".nooa" / "sessions")
 
     @staticmethod
@@ -607,6 +620,12 @@ class CodingACPAdapter:
 
 
 async def serve(llm_factory: Callable[[], UnifiedLLM]) -> None:
+    if sys.platform == "win32":
+        # NumPy's native initialization can block while ACP's Windows stdio
+        # reader waits for input. Load this optional REPL dependency first.
+        with suppress(ImportError):
+            import numpy  # noqa: F401
+
     adapter = CodingACPAdapter(llm_factory)
     try:
         # session/close is registered by the router as unstable. initialize()

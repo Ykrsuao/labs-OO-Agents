@@ -103,3 +103,38 @@ class TestProbeOtlpEndpoint:
             probe_otlp_endpoint("http://localhost:5001/v1/traces", timeout=2.0)
 
         assert captured["timeout"] == 2.0
+
+
+@pytest.mark.parametrize(
+    "endpoint, configured_timeout, expected_timeout",
+    [
+        (None, None, 0.1),
+        (None, "1.5", 1.5),
+        ("http://collector.example:4318/v1/traces", None, 2.0),
+        ("http://collector.example:4318/v1/traces", "0.7", 0.7),
+        ("http://localhost:5001/v1/traces", None, 2.0),
+    ],
+)
+def test_automatic_tracing_bounds_only_unconfigured_local_discovery(
+    monkeypatch, endpoint, configured_timeout, expected_timeout
+):
+    from nooa.tracing import enable_tracing
+
+    for name, value in [
+        ("OTLP_ENDPOINT", endpoint),
+        ("OTLP_PROBE_TIMEOUT", configured_timeout),
+    ]:
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    observed = []
+
+    def unavailable(req, timeout):
+        observed.append(timeout)
+        raise TimeoutError
+
+    with patch("urllib.request.urlopen", side_effect=unavailable):
+        enable_tracing()
+
+    assert observed == [expected_timeout]

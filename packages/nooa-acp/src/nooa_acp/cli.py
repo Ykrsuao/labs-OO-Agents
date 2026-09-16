@@ -27,14 +27,18 @@ if TYPE_CHECKING:
 )
 def command(model: str, client_type: str | None) -> None:
     """Serve the NOOA coding agent over ACP on standard input/output."""
-    from nooa.secrets import load_secrets_into_env
-    from nooa.unifiedllm import get_llm_client
+    # Provider imports can fetch remote metadata before ACP is ready.
+    # Use the bundled map unless the launcher explicitly opts into refreshes.
+    os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
     from nooa_acp.server import serve
 
-    load_secrets_into_env()
-    nvidia_api_key = os.getenv("NVIDIA_API_KEY") if model.startswith("nvidia_nim/") else None
-
     def llm_factory() -> "UnifiedLLM":
+        from nooa.secrets import load_secrets_into_env
+        from nooa.unifiedllm import get_llm_client
+
+        load_secrets_into_env()
+        nvidia_api_key = os.getenv("NVIDIA_API_KEY") if model.startswith("nvidia_nim/") else None
         overrides = {"api_key": nvidia_api_key} if nvidia_api_key else {}
         return get_llm_client(model, client_type=client_type, **overrides)
 

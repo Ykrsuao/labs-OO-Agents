@@ -59,6 +59,22 @@ instead:
 uv run --project "$PWD" --package nooa-acp -- nooa-acp
 ```
 
+For repeated editor launches from an already-synced checkout, use
+`uv run --frozen --no-sync --project "$PWD" --package nooa-acp -- nooa-acp`.
+Run `uv sync --frozen --group dev` after updating the checkout before using
+`--no-sync`.
+
+The ACP handshake does not import the model framework. It is loaded when a
+session first needs it. ACP defaults `LITELLM_LOCAL_MODEL_COST_MAP=True` before
+provider imports, so startup uses LiteLLM's bundled model metadata instead of
+waiting for a remote download. Set that environment variable to `False` in the
+launcher to opt into remote refreshes; bundled pricing and context-window
+metadata only change when the installed dependency is updated.
+
+Automatic discovery of an unconfigured local Trace Viewer uses a short
+0.1-second socket timeout. Explicit `OTLP_ENDPOINT` and `OTLP_PROBE_TIMEOUT`
+settings are respected.
+
 ### MCP servers do not carry over from Zed
 
 **Remote MCP servers you authenticated inside Zed are not usable from an ACP

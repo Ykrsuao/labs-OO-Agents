@@ -426,14 +426,16 @@ def _default_exporters() -> list[SpanExporter] | None:
 
     When ``OTLP_ENDPOINT`` is explicitly set the user opted in — warn on failure.
     When using the default endpoint, stay silent so tracing is invisible until
-    ``nooa start-dev`` is running.
+    ``nooa start-dev`` is running. Keep that optional local discovery short;
+    explicitly configured endpoints and probe timeouts retain their defaults.
     """
     global _probe_failed
 
     explicit_endpoint = os.getenv("OTLP_ENDPOINT")
     endpoint = explicit_endpoint or "http://localhost:5001/v1/traces"
+    timeout = 0.1 if explicit_endpoint is None and "OTLP_PROBE_TIMEOUT" not in os.environ else None
 
-    if probe_otlp_endpoint(endpoint):
+    if probe_otlp_endpoint(endpoint, timeout=timeout):
         return [exporters_mod.journal(endpoint=endpoint)]
 
     _probe_failed = True

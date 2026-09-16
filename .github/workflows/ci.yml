@@ -94,6 +94,13 @@ jobs:
           tests/platform/test_powershell_session.py
           tests/platform/test_bash_lifecycle.py
           -q --timeout=90
+      - name: Native ACP startup and session lifecycle
+        run: >-
+          uv run --frozen --no-sync pytest
+          packages/nooa-acp/tests/test_cli.py
+          packages/nooa-acp/tests/test_protocol.py::test_real_cli_handshake_does_not_import_the_model_framework
+          packages/nooa-acp/tests/test_protocol.py::test_real_cli_creates_and_closes_a_session_without_a_model_call
+          -q --timeout=90
 
   python-313-error-compat:
     runs-on: ubuntu-latest

@@ -4,6 +4,7 @@
 
 import asyncio
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,65 @@ class _RecordingClient:
             self.tool_started.set()
         if isinstance(update, AvailableCommandsUpdate):
             self.commands_updated.set()
+
+
+async def test_real_cli_handshake_does_not_import_the_model_framework(tmp_path):
+    script = textwrap.dedent(
+        """
+        import importlib.abc
+        import sys
+
+        class RejectFrameworkImport(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname in {"nooa", "nooa_cli"}:
+                    raise AssertionError(f"ACP handshake imported {fullname}")
+
+        sys.meta_path.insert(0, RejectFrameworkImport())
+
+        from nooa_acp.cli import main
+        main()
+        """
+    )
+
+    async with spawn_agent_process(
+        _RecordingClient(),  # type: ignore[arg-type]
+        sys.executable,
+        "-c",
+        script,
+        "--model",
+        "openai/gpt-4o-mini",
+        cwd=tmp_path,
+    ) as (connection, _process):
+        initialized = await asyncio.wait_for(
+            connection.initialize(PROTOCOL_VERSION), timeout=_HANG_TIMEOUT
+        )
+
+    assert initialized.agent_info is not None
+    assert initialized.agent_info.name == "nooa-acp"
+    assert initialized.agent_capabilities.load_session is True
+
+
+async def test_real_cli_creates_and_closes_a_session_without_a_model_call(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEMO_OO_USER_DIR", str(tmp_path / "user-config"))
+    monkeypatch.delenv("NEMO_OO_SETTINGS", raising=False)
+    monkeypatch.delenv("OTLP_ENDPOINT", raising=False)
+    monkeypatch.delenv("OTLP_PROBE_TIMEOUT", raising=False)
+
+    async with spawn_agent_process(
+        _RecordingClient(),  # type: ignore[arg-type]
+        sys.executable,
+        "-c",
+        "from nooa_acp.cli import main; main()",
+        "--model",
+        "openai/gpt-4o-mini",
+        cwd=tmp_path,
+    ) as (connection, _process):
+        await asyncio.wait_for(connection.initialize(PROTOCOL_VERSION), timeout=_HANG_TIMEOUT)
+        session = await asyncio.wait_for(
+            connection.new_session(str(tmp_path)), timeout=_HANG_TIMEOUT
+        )
+        assert session.session_id
+        await asyncio.wait_for(connection.close_session(session.session_id), timeout=_HANG_TIMEOUT)
 
 
 def _write_protocol_skill(workspace: Path) -> None:
